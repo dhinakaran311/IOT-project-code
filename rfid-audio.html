@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>RFID → Audio (Web Serial)</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      :root {
+        font-family: system-ui, Arial, sans-serif;
+      }
+      body {
+        display: flex;
+        min-height: 100svh;
+        align-items: center;
+        justify-content: center;
+        background: #0f172a;
+        color: #e5e7eb;
+      }
+      .card {
+        background: #111827;
+        padding: 24px;
+        border-radius: 16px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+        width: min(560px, 90vw);
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 22px;
+      }
+      p {
+        margin: 8px 0;
+        opacity: 0.9;
+      }
+      button {
+        padding: 10px 16px;
+        font-weight: 600;
+        border: 0;
+        border-radius: 10px;
+        background: #2563eb;
+        color: white;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .row {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-top: 12px;
+      }
+      .log {
+        margin-top: 14px;
+        background: #0b1220;
+        border: 1px solid #1f2937;
+        padding: 10px;
+        border-radius: 10px;
+        height: 160px;
+        overflow: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+      .pill {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #1f2937;
+        font-size: 12px;
+        margin-left: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>RFID → Spoken Item <span class="pill">via Web Serial</span></h1>
+      <p>
+        Click <b>Connect</b>, pick your ESP32 port, then scan tags. It will play
+        the mapped MP3.
+      </p>
+
+      <div class="row">
+        <button id="connectBtn">Connect</button>
+        <span id="status">Not connected</span>
+      </div>
+
+      <div class="row">
+        <label
+          >Apple MP3:
+          <input type="file" id="appleFile" accept="audio/mpeg,audio/mp3"
+        /></label>
+        <label
+          >Milk MP3:
+          <input type="file" id="milkFile" accept="audio/mpeg,audio/mp3"
+        /></label>
+      </div>
+
+      <div class="log" id="log"></div>
+
+      <!-- Default audio files (must exist next to this HTML) -->
+      <audio id="appleAudio" src="apple.mp3" preload="auto"></audio>
+      <audio id="milkAudio" src="milk.mp3" preload="auto"></audio>
+    </div>
+
+    <script>
+      (async function () {
+        const connectBtn = document.getElementById("connectBtn");
+        const statusEl = document.getElementById("status");
+        const logEl = document.getElementById("log");
+
+        // Map Product Name (from ESP32) → audio element
+        const audioMap = {
+          Apple: document.getElementById("appleAudio"),
+          Milk: document.getElementById("milkAudio"),
+          // Add more later:
+          // "Banana": document.getElementById('bananaAudio'),
+          // "Bread":  document.getElementById('breadAudio'),
+        };
+
+        // Let you swap MP3s without editing the file
+        bindFileInput("appleFile", audioMap["Apple"]);
+        bindFileInput("milkFile", audioMap["Milk"]);
+
+        function bindFileInput(inputId, audioEl) {
+          const input = document.getElementById(inputId);
+          input.addEventListener("change", () => {
+            const file = input.files?.[0];
+            if (file) {
+              audioEl.src = URL.createObjectURL(file);
+              appendLog(`Loaded custom MP3: ${file.name}`);
+            }
+          });
+        }
+
+        let port, reader;
+
+        connectBtn.addEventListener("click", async () => {
+          try {
+            await ensureSerialSupport();
+            port = await navigator.serial.requestPort();
+            await port.open({ baudRate: 115200 });
+            statusEl.textContent = "Connected";
+            connectBtn.disabled = true;
+            appendLog("Listening for lines like: EVENT:ADD:Apple:80.00");
+
+            const decoder = new TextDecoderStream();
+            port.readable.pipeTo(decoder.writable);
+            reader = decoder.readable.getReader();
+
+            let buffer = "";
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (value) {
+                buffer += value;
+                let lines = buffer.split(/\r?\n/);
+                buffer = lines.pop(); // keep last partial
+                for (const line of lines) handleLine(line.trim());
+              }
+            }
+          } catch (e) {
+            appendLog("Error: " + e.message);
+            statusEl.textContent = "Error / Disconnected";
+            connectBtn.disabled = false;
+          }
+        });
+
+        function handleLine(line) {
+          if (!line) return;
+          appendLog("← " + line);
+
+          // Expected: EVENT:TYPE:NAME:PRICE
+          const m = /^EVENT:([^:]+):([^:]+):?([^:]*)$/.exec(line);
+          if (!m) return;
+          const [, type, name] = m;
+
+          if (type === "ADD") playFor(name);
+        }
+
+        async function playFor(productName) {
+          const audio = audioMap[productName];
+          if (!audio) {
+            appendLog(`No audio mapped for "${productName}"`);
+            return;
+          }
+          try {
+            await audio.play();
+            appendLog(`Playing: ${productName}`);
+          } catch (err) {
+            appendLog(
+              `Autoplay blocked. Click once on the page and try again. (${err?.message})`
+            );
+          }
+        }
+
+        function appendLog(msg) {
+          const t = new Date().toLocaleTimeString();
+          logEl.textContent += `[${t}] ${msg}\n`;
+          logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        async function ensureSerialSupport() {
+          if (!("serial" in navigator)) {
+            throw new Error(
+              "Web Serial not supported. Use Chrome/Edge desktop."
+            );
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>
